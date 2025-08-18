@@ -1,279 +1,265 @@
 require("./models/db");
+require('dotenv').config();
 
 const express = require("express");
 const path = require("path");
 const { engine } = require("express-handlebars");
+const bodyParser = require("body-parser");
+const fileUpload = require("express-fileupload");
+const fs = require("fs");
+const mongoose = require("mongoose");
+const cors = require("cors");
 
-const bodyparser = require("body-parser");
-
+// Controllers
 const employeeController = require("./controllers/employeeController");
 const homeController = require("./controllers/homeController");
 const loginController = require("./controllers/loginController");
-const fileUpload = require("express-fileupload");
-const fs = require("fs");
-var connectionId;
-var _userConnections = [];
-var app = express();
-app.use(
-    bodyparser.urlencoded({
-        extended: true,
-    })
-);
-app.use(bodyparser.json());
-app.set("views", path.join(__dirname, "/views/"));
-app.engine("hbs", engine({
-    extname: "hbs",
-    defaultLayout: "mainLayout",
-    layoutsDir: __dirname + "/views/layouts/",
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Middleware Configuration
+app.use(cors({
+  origin: process.env.NODE_ENV === 'production' 
+    ? process.env.PRODUCTION_URL 
+    : `http://localhost:${PORT}`,
+  credentials: true
 }));
 
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(bodyParser.json());
+app.use(fileUpload());
 app.use(express.static(path.join(__dirname, "public")));
+
+// View Engine Setup
+app.set("views", path.join(__dirname, "/views/"));
+app.engine("hbs", engine({
+  extname: "hbs",
+  defaultLayout: "mainLayout",
+  layoutsDir: __dirname + "/views/layouts/",
+}));
 app.set("view engine", "hbs");
 
-// app.listen(3000, () => {
-//   console.log("Express server started at port : 3000");
-// });
-
+// Routes
 app.use("/employee", employeeController);
 app.use("/", homeController);
 app.use("/sign", loginController);
-server = app.listen(process.env.PORT || 3000);
-/*   for webrtc application */
-const io = require("socket.io")(server);
 
-//listen on every connection
-io.on("connection", (socket) => {
-    console.log(socket.id);
-
-    socket.on("userconnect", (data) => {
-        console.log("userconnect", data.dsiplayName, data.meetingid);
-
-        var other_users = _userConnections.filter(
-            (p) => p.meeting_id == data.meetingid
-        );
-
-        _userConnections.push({
-            connectionId: socket.id,
-            user_id: data.dsiplayName,
-            meeting_id: data.meetingid,
-        });
-        var userCount = _userConnections.length;
-        console.log(userCount);
-        other_users.forEach((v) => {
-            socket.to(v.connectionId).emit("informAboutNewConnection", {
-                other_user_id: data.dsiplayName,
-                connId: socket.id,
-                userNumber: userCount,
-            });
-        });
-
-        socket.emit("userconnected", other_users);
-        //return other_users;
-    }); //end of userconnect
-
-    socket.on("exchangeSDP", (data) => {
-        socket.to(data.to_connid).emit("exchangeSDP", {
-            message: data.message,
-            from_connid: socket.id,
-        });
-    }); //end of exchangeSDP
-
-    socket.on("reset", (data) => {
-        var userObj = _userConnections.find((p) => p.connectionId == socket.id);
-        if (userObj) {
-            var meetingid = userObj.meeting_id;
-            var list = _userConnections.filter((p) => p.meeting_id == meetingid);
-            _userConnections = _userConnections.filter(
-                (p) => p.meeting_id != meetingid
-            );
-
-            list.forEach((v) => {
-                socket.to(v.connectionId).emit("reset");
-            });
-
-            socket.emit("reset");
-        }
-    }); //end of reset
-
-    socket.on("sendMessage", (msg) => {
-        console.log(msg);
-        var userObj = _userConnections.find((p) => p.connectionId == socket.id);
-        if (userObj) {
-            var meetingid = userObj.meeting_id;
-            var from = userObj.user_id;
-
-            var list = _userConnections.filter((p) => p.meeting_id == meetingid);
-            console.log(list);
-
-            list.forEach((v) => {
-                socket.to(v.connectionId).emit("showChatMessage", {
-                    from: from,
-                    message: msg,
-                    time: getCurrDateTime(),
-                });
-            });
-
-            socket.emit("showChatMessage", {
-                from: from,
-                message: msg,
-                time: getCurrDateTime(),
-            });
-        }
-    }); //end of reset
-
-    socket.on("fileTransferToOther", function (msg) {
-        console.log(msg);
-        var userObj = _userConnections.find((p) => p.connectionId == socket.id);
-        if (userObj) {
-            var meetingid = userObj.meeting_id;
-            var from = userObj.user_id;
-
-            var list = _userConnections.filter((p) => p.meeting_id == meetingid);
-            console.log(list);
-
-            list.forEach((v) => {
-                socket.to(v.connectionId).emit("showFileMessage", {
-                    from: from,
-                    username: msg.username,
-                    meetingid: msg.meetingid,
-                    FileePath: msg.FileePath,
-                    fileeName: msg.fileeName,
-                    time: getCurrDateTime(),
-                });
-            });
-        }
-    });
-    socket.on("disconnect", function () {
-        console.log("Got disconnect!");
-
-        var userObj = _userConnections.find((p) => p.connectionId == socket.id);
-        if (userObj) {
-            var meetingid = userObj.meeting_id;
-
-            _userConnections = _userConnections.filter(
-                (p) => p.connectionId != socket.id
-            );
-            var list = _userConnections.filter((p) => p.meeting_id == meetingid);
-
-            list.forEach((v) => {
-                var userCou = _userConnections.length;
-                socket.to(v.connectionId).emit("informAboutConnectionEnd", {
-                    connId: socket.id,
-                    userCoun: userCou,
-                });
-            });
-        }
-    });
+// Socket.IO Server Setup
+const server = require('http').createServer(app);
+const io = require("socket.io")(server, {
+  cors: {
+    origin: process.env.NODE_ENV === 'production' 
+      ? process.env.PRODUCTION_URL 
+      : `http://localhost:${PORT}`,
+    methods: ["GET", "POST"]
+  },
+  transports: ['websocket', 'polling'],
+  pingTimeout: 60000
 });
 
-function getCurrDateTime() {
-    let date_ob = new Date();
-    let date = ("0" + date_ob.getDate()).slice(-2);
-    let month = ("0" + (date_ob.getMonth() + 1)).slice(-2);
-    let year = date_ob.getFullYear();
-    let hours = date_ob.getHours();
-    let minutes = date_ob.getMinutes();
-    let seconds = date_ob.getSeconds();
-    var dt =
-        year +
-        "-" +
-        month +
-        "-" +
-        date +
-        " " +
-        hours +
-        ":" +
-        minutes +
-        ":" +
-        seconds;
-    return dt;
+// WebRTC Connection Management
+const userConnections = [];
+
+io.on("connection", (socket) => {
+  console.log(`New connection: ${socket.id}`);
+
+  // User Connection Handler
+  socket.on("userconnect", (data) => {
+    console.log(`User connected: ${data.displayName} to meeting ${data.meetingid}`);
+
+    const otherUsers = userConnections.filter(
+      user => user.meeting_id === data.meetingid
+    );
+
+    userConnections.push({
+      connectionId: socket.id,
+      user_id: data.displayName,
+      meeting_id: data.meetingid,
+    });
+
+    const userCount = userConnections.length;
+    console.log(`Total users: ${userCount}`);
+
+    // Notify other users about new connection
+    otherUsers.forEach(user => {
+      socket.to(user.connectionId).emit("informAboutNewConnection", {
+        other_user_id: data.displayName,
+        connId: socket.id,
+        userNumber: userCount,
+      });
+    });
+
+    // Send existing users to new connection
+    socket.emit("userconnected", otherUsers);
+  });
+
+  // WebRTC Signaling
+  socket.on("exchangeSDP", (data) => {
+    socket.to(data.to_connid).emit("exchangeSDP", {
+      message: data.message,
+      from_connid: socket.id,
+    });
+  });
+
+  // Meeting Reset
+  socket.on("reset", (data) => {
+    const userObj = userConnections.find(user => user.connectionId === socket.id);
+    if (userObj) {
+      const meetingid = userObj.meeting_id;
+      const meetingUsers = userConnections.filter(user => user.meeting_id === meetingid);
+      
+      // Remove all users from this meeting
+      userConnections = userConnections.filter(
+        user => user.meeting_id !== meetingid
+      );
+
+      // Notify all users in meeting
+      meetingUsers.forEach(user => {
+        socket.to(user.connectionId).emit("reset");
+      });
+
+      socket.emit("reset");
+    }
+  });
+
+  // Chat Messaging
+  socket.on("sendMessage", (msg) => {
+    const userObj = userConnections.find(user => user.connectionId === socket.id);
+    if (userObj) {
+      const meetingid = userObj.meeting_id;
+      const from = userObj.user_id;
+
+      const meetingUsers = userConnections.filter(user => user.meeting_id === meetingid);
+
+      // Broadcast message to all meeting participants
+      meetingUsers.forEach(user => {
+        socket.to(user.connectionId).emit("showChatMessage", {
+          from: from,
+          message: msg,
+          time: getCurrentDateTime(),
+        });
+      });
+
+      // Also send to sender
+      socket.emit("showChatMessage", {
+        from: from,
+        message: msg,
+        time: getCurrentDateTime(),
+      });
+    }
+  });
+
+  // File Transfer
+  socket.on("fileTransferToOther", (msg) => {
+    const userObj = userConnections.find(user => user.connectionId === socket.id);
+    if (userObj) {
+      const meetingid = userObj.meeting_id;
+      const from = userObj.user_id;
+
+      const meetingUsers = userConnections.filter(user => user.meeting_id === meetingid);
+
+      meetingUsers.forEach(user => {
+        socket.to(user.connectionId).emit("showFileMessage", {
+          from: from,
+          username: msg.username,
+          meetingid: msg.meetingid,
+          filePath: msg.filePath,
+          fileName: msg.fileName,
+          time: getCurrentDateTime(),
+        });
+      });
+    }
+  });
+
+  // Disconnection Handler
+  socket.on("disconnect", () => {
+    console.log(`User disconnected: ${socket.id}`);
+
+    const userObj = userConnections.find(user => user.connectionId === socket.id);
+    if (userObj) {
+      const meetingid = userObj.meeting_id;
+
+      // Remove disconnected user
+      userConnections = userConnections.filter(
+        user => user.connectionId !== socket.id
+      );
+
+      const remainingUsers = userConnections.filter(user => user.meeting_id === meetingid);
+
+      // Notify remaining users
+      remainingUsers.forEach(user => {
+        const userCount = userConnections.length;
+        socket.to(user.connectionId).emit("informAboutConnectionEnd", {
+          connId: socket.id,
+          userCount: userCount,
+        });
+      });
+    }
+  });
+});
+
+// File Upload Endpoints
+const Game = mongoose.model("Game", new mongoose.Schema({
+  title: String,
+  creator: String,
+  width: Number,
+  height: Number,
+  fileName: String,
+  thumbnailFile: String,
+  meetingid: String,
+  username: String,
+}));
+
+app.post("/attachimg_other_info", (req, res) => {
+  res.send(req.body.meeting_id);
+});
+
+app.post("/attachimg", async (req, res) => {
+  try {
+    const { meeting_id, username, title, creator, width, height } = req.body;
+    const imageFile = req.files.zipfile;
+    
+    // Create meeting directory if it doesn't exist
+    const dir = `public/attachment/${meeting_id}/`;
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    // Move uploaded file
+    await imageFile.mv(`${dir}${imageFile.name}`);
+
+    // Save to database
+    await Game.create({
+      title,
+      creator,
+      width,
+      height,
+      thumbnailFile: imageFile.name,
+      meetingid: meeting_id,
+      username,
+    });
+
+    res.send(creator);
+  } catch (error) {
+    console.error("File upload error:", error);
+    res.status(500).send("Error uploading file");
+  }
+});
+
+// Helper Functions
+function getCurrentDateTime() {
+  const now = new Date();
+  return now.toISOString().replace('T', ' ').substring(0, 19);
 }
 
-// .........for file fileUpload.............
-app.use(fileUpload());
-const bodyParser = require("body-parser");
-const mongoose = require("mongoose");
-
-app.use(
-    bodyParser.urlencoded({
-        extended: true,
-    })
-);
-var gameSchema = new mongoose.Schema({
-    title: String,
-    creator: String,
-    width: Number,
-    height: Number,
-    fileName: String,
-    thumbnailFile: String,
-    meetingid: String,
-    username: String,
+// Error Handling Middleware
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).send('Something broke!');
 });
 
-var Game = mongoose.model("Game", gameSchema);
-
-// app.get("/addgame", function (req, res) {
-//   res.render("home/addgame");
-// });
-
-app.post("/attachimg_other_info", function (req, res) {
-    var meeting_idd = req.body.meeting_id;
-    res.send(meeting_idd);
-});
-app.post("/attachimg", function (req, res) {
-    var data = req.body;
-
-    //a variable representation of the files
-    // var gameFile = req.files.gamefile;
-    var imageFile = req.files.zipfile;
-    console.log(imageFile);
-    //Using the files to call upon the method to move that file to a folder
-    // gameFile.mv("public/images/" + gameFile.name, function (error) {
-    //   if (error) {
-    //     console.log("Couldn't upload the game file");
-    //     console.log(error);
-    //   } else {
-    //     console.log("Game file succesfully uploaded.");
-    //   }
-    // });
-    var dir = "public/attachment/" + data.meeting_id + "/";
-    if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir);
-    }
-    imageFile.mv(
-        "public/attachment/" + data.meeting_id + "/" + imageFile.name,
-        function (error) {
-            if (error) {
-                console.log("Couldn't upload the image file");
-                console.log(error);
-            } else {
-                console.log("Image file succesfully uploaded.");
-            }
-        }
-    );
-
-    Game.create({
-            title: data.title,
-            creator: data.creator,
-            width: data.width,
-            height: data.height,
-            thumbnailFile: imageFile.name,
-            meetingid: data.meeting_id,
-            username: data.username,
-        },
-        function (error, data) {
-            if (error) {
-                console.log("There was a problem adding this game to the database");
-            } else {
-                console.log("Game added to database");
-                console.log(data);
-            }
-        }
-    );
-    // res.redirect("/?meetingID=324234324");
-    res.send(data.creator);
-    // return true;
-    // res.writeHead(200, { "Content-Type": "text/plain" });
-    // res.write("feeling cool");
-    // res.end();
+// Start Server
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
