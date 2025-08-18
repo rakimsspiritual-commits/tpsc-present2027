@@ -1,643 +1,679 @@
 var WrtcHelper = (function () {
-  const iceConfiguration = {
+  // Constants
+  const ICE_CONFIGURATION = {
     iceServers: [
-      {
-        urls: "stun:stun.l.google.com:19302",
-      },
-      {
-        urls: "stun:stun1.l.google.com:19302",
-      },
-      {
-        urls: "stun:stun2.l.google.com:19302",
-      },
-      {
-        urls: "stun:stun3.l.google.com:19302",
-      },
-      {
-        urls: "stun:stun4.l.google.com:19302",
-      },
-    ],
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun1.l.google.com:19302" },
+      { urls: "stun:stun2.l.google.com:19302" },
+      { urls: "stun:stun3.l.google.com:19302" },
+      { urls: "stun:stun4.l.google.com:19302" },
+      // Consider adding TURN servers for better NAT traversal
+      // { urls: "turn:your-turn-server.com", username: "user", credential: "pass" }
+    ]
   };
 
-  var _audioTrack;
+  const VideoStates = Object.freeze({
+    NONE: 0,
+    CAMERA: 1,
+    SCREEN_SHARE: 2
+  });
 
-  var peers_conns = [];
-  var peers_con_ids = [];
+  // Private variables
+  let audioTrack = null;
+  let peersConns = {};
+  let peersConIds = [];
+  let remoteVideoStreams = {};
+  let remoteAudioStreams = {};
+  let localVideoPlayer = null;
+  let rtpVideoSenders = {};
+  let rtpAudioSenders = {};
+  let serverFn = null;
+  let videoState = VideoStates.NONE;
+  let videoCamSSTrack = null;
+  let isAudioMute = true;
+  let myConnId = "";
 
-  var _remoteVideoStreams = [];
-  var _remoteAudioStreams = [];
-
-  var _localVideoPlayer;
-
-  var _rtpVideoSenders = [];
-  var _rtpAudioSenders = [];
-
-  var _serverFn;
-
-  var VideoStates = {
-    None: 0,
-    Camera: 1,
-    ScreenShare: 2,
-  };
-  var _videoState = VideoStates.None;
-  var _videoCamSSTrack;
-  var _isAudioMute = true;
-  var _my_connid = "";
-
-  async function _init(serFn, myconnid) {
-    _my_connid = myconnid;
-    _serverFn = serFn;
-    _localVideoPlayer = document.getElementById("localVideoCtr");
+  // Private methods
+  async function init(serFn, myconnid) {
+    myConnId = myconnid;
+    serverFn = serFn;
+    localVideoPlayer = document.getElementById("localVideoCtr");
+    
+    if (!localVideoPlayer) {
+      console.error("Local video container not found");
+      return;
+    }
 
     eventBinding();
   }
 
   function eventBinding() {
-    $("#btnMuteUnmute").on("click", async function () {
-      if (!_audioTrack) {
-        await startwithAudio();
-      }
+    const $btnMuteUnmute = $("#btnMuteUnmute");
+    const $btnStartStopCam = $("#btnStartStopCam");
+    const $btnStartStopScreenshare = $("#btnStartStopScreenshare");
 
-      if (!_audioTrack) {
-        alert("problem with audio permission");
-        return;
-      }
-
-      if (_isAudioMute) {
-        _audioTrack.enabled = true;
-        $(this).html('<span class="material-icons">mic</span>');
-        AddUpdateAudioVideoSenders(_audioTrack, _rtpAudioSenders);
-      } else {
-        _audioTrack.enabled = false;
-        $(this).html('<span class="material-icons">mic_off</span>');
-
-        RemoveAudioVideoSenders(_rtpAudioSenders);
-      }
-      _isAudioMute = !_isAudioMute;
-
-      console.log(_audioTrack);
-    });
-    $("#btnStartStopCam").on("click", async function () {
-      if (_videoState == VideoStates.Camera) {
-        //Stop case
-        await ManageVideo(VideoStates.None);
-      } else {
-        await ManageVideo(VideoStates.Camera);
-      }
-    });
-    $("#btnStartStopScreenshare").on("click", async function () {
-      if (_videoState == VideoStates.ScreenShare) {
-        //Stop case
-        await ManageVideo(VideoStates.None);
-      } else {
-        await ManageVideo(VideoStates.ScreenShare);
-      }
-    });
-  }
-  //Camera or Screen Share or None
-  async function ManageVideo(_newVideoState) {
-    if (_newVideoState == VideoStates.None) {
-      $("#btnStartStopCam").html(
-        '<span class="material-icons">videocam_off</span>'
-      );
-      $("#btnStartStopScreenshare").html(
-        '<div class="present-now-wrap d-flex justify-content-center flex-column align-items-center  mr-5 cursor-pointer" id="btnStartStopScreenshare" style="height:10vh;"><div class="present-now-icon"><span class="material-icons">present_to_all</span></div><div>Present Now</div></div>'
-      );
-      _videoState = _newVideoState;
-
-      ClearCurrentVideoCamStream(_rtpVideoSenders);
+    if (!$btnMuteUnmute.length || !$btnStartStopCam.length || !$btnStartStopScreenshare.length) {
+      console.error("Required buttons not found in DOM");
       return;
     }
 
+    $btnMuteUnmute.on("click", handleMuteUnmute);
+    $btnStartStopCam.on("click", () => handleVideoStateChange(VideoStates.CAMERA));
+    $btnStartStopScreenshare.on("click", () => handleVideoStateChange(VideoStates.SCREEN_SHARE));
+  }
+
+  async function handleMuteUnmute() {
     try {
-      var vstream = null;
+      if (!audioTrack) {
+        await startWithAudio();
+        if (!audioTrack) {
+          showAlert("Problem with audio permission");
+          return;
+        }
+      }
 
-      if (_newVideoState == VideoStates.Camera) {
-        vstream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            width: 1920,
-            height: 1080,
-          },
-          audio: false,
+      isAudioMute = !isAudioMute;
+      audioTrack.enabled = !isAudioMute;
+
+      const $this = $(this);
+      $this.html(isAudioMute 
+        ? '<span class="material-icons">mic_off</span>' 
+        : '<span class="material-icons">mic</span>');
+
+      if (isAudioMute) {
+        await removeAudioVideoSenders(rtpAudioSenders);
+      } else {
+        await addUpdateAudioVideoSenders(audioTrack, rtpAudioSenders);
+      }
+    } catch (error) {
+      console.error("Mute/unmute error:", error);
+      showAlert("Error toggling audio");
+    }
+  }
+
+  async function handleVideoStateChange(newVideoState) {
+    try {
+      // If clicking the current active state, turn it off
+      if (videoState === newVideoState) {
+        newVideoState = VideoStates.NONE;
+      }
+
+      await manageVideo(newVideoState);
+    } catch (error) {
+      console.error("Video state change error:", error);
+      showAlert("Error changing video state");
+    }
+  }
+
+  async function manageVideo(newVideoState) {
+    try {
+      // Clean up previous state
+      if (videoState !== VideoStates.NONE) {
+        await clearCurrentVideoCamStream(rtpVideoSenders);
+      }
+
+      // Update UI based on new state
+      updateVideoUI(newVideoState);
+
+      videoState = newVideoState;
+
+      // Handle new media if needed
+      if (newVideoState !== VideoStates.NONE) {
+        await setupNewVideoStream(newVideoState);
+      }
+    } catch (error) {
+      console.error("Video management error:", error);
+      throw error;
+    }
+  }
+
+  function updateVideoUI(newVideoState) {
+    const $btnStartStopCam = $("#btnStartStopCam");
+    const $btnStartStopScreenshare = $("#btnStartStopScreenshare");
+
+    switch (newVideoState) {
+      case VideoStates.NONE:
+        $btnStartStopCam.html('<span class="material-icons">videocam_off</span>');
+        $btnStartStopScreenshare.html(
+          '<div class="present-now-wrap d-flex justify-content-center flex-column align-items-center mr-5 cursor-pointer" id="btnStartStopScreenshare" style="height:10vh;">' +
+            '<div class="present-now-icon"><span class="material-icons">present_to_all</span></div>' +
+            '<div>Present Now</div>' +
+          '</div>'
+        );
+        break;
+      case VideoStates.CAMERA:
+        $btnStartStopCam.html('<span class="material-icons">videocam</span>');
+        $btnStartStopScreenshare.text("Screen Share");
+        break;
+      case VideoStates.SCREEN_SHARE:
+        $btnStartStopCam.html('<span class="material-icons">videocam_off</span>');
+        $btnStartStopScreenshare.html(
+          '<div class="present-now-wrap d-flex justify-content-center flex-column align-items-center mr-5 cursor-pointer" id="btnStartStopScreenshare" style="height:10vh;">' +
+            '<div class="present-now-icon"><span class="material-icons">present_to_all</span></div>' +
+            '<div>Stop Present Now</div>' +
+          '</div>'
+        );
+        break;
+    }
+  }
+
+  async function setupNewVideoStream(newVideoState) {
+    let stream;
+    try {
+      if (newVideoState === VideoStates.CAMERA) {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 1920, height: 1080 },
+          audio: false
         });
-      } else if (_newVideoState == VideoStates.ScreenShare) {
-        vstream = await navigator.mediaDevices.getDisplayMedia({
-          video: {
-            width: 1920,
-            height: 1080,
-          },
-          audio: false,
+      } else if (newVideoState === VideoStates.SCREEN_SHARE) {
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: { width: 1920, height: 1080 },
+          audio: false
         });
 
-        vstream.oninactive = (e) => {
-          ClearCurrentVideoCamStream(_rtpVideoSenders);
-          $("#btnStartStopScreenshare").html(
-            '<div class="present-now-wrap d-flex justify-content-center flex-column align-items-center  mr-5 cursor-pointer" id="btnStartStopScreenshare" style="height:10vh;"><div class="present-now-icon"><span class="material-icons">present_to_all</span></div><div>Present Now</div></div>'
-          );
+        stream.getVideoTracks()[0].onended = () => {
+          manageVideo(VideoStates.NONE);
         };
       }
 
-      ClearCurrentVideoCamStream(_rtpVideoSenders);
-
-      _videoState = _newVideoState;
-
-      if (_newVideoState == VideoStates.Camera) {
-        $("#btnStartStopCam").html(
-          '<span class="material-icons">videocam</span>'
-        );
-        $("#btnStartStopScreenshare").text("Screen Share");
-      } else if (_newVideoState == VideoStates.ScreenShare) {
-        $("#btnStartStopCam").html(
-          '<span class="material-icons">videocam_off</span>'
-        );
-        $("#btnStartStopScreenshare").html(
-          '<div class="present-now-wrap d-flex justify-content-center flex-column align-items-center  mr-5 cursor-pointer" id="btnStartStopScreenshare" style="height:10vh;"><div class="present-now-icon"><span class="material-icons">present_to_all</span></div><div>Stop Present Now</div></div>'
-        );
+      if (stream && stream.getVideoTracks().length > 0) {
+        videoCamSSTrack = stream.getVideoTracks()[0];
+        localVideoPlayer.srcObject = new MediaStream([videoCamSSTrack]);
+        await addUpdateAudioVideoSenders(videoCamSSTrack, rtpVideoSenders);
       }
-
-      if (vstream && vstream.getVideoTracks().length > 0) {
-        _videoCamSSTrack = vstream.getVideoTracks()[0];
-
-        if (_videoCamSSTrack) {
-          _localVideoPlayer.srcObject = new MediaStream([_videoCamSSTrack]);
-
-          AddUpdateAudioVideoSenders(_videoCamSSTrack, _rtpVideoSenders);
-        }
-      }
-    } catch (e) {
-      console.log(e);
-      return;
+    } catch (error) {
+      console.error("Stream setup error:", error);
+      throw error;
     }
   }
 
-  function ClearCurrentVideoCamStream(rtpVideoSenders) {
-    if (_videoCamSSTrack) {
-      _videoCamSSTrack.stop();
-      _videoCamSSTrack = null;
-      _localVideoPlayer.srcObject = null;
-
-      RemoveAudioVideoSenders(rtpVideoSenders);
+  async function clearCurrentVideoCamStream(rtpSenders) {
+    if (videoCamSSTrack) {
+      videoCamSSTrack.stop();
+      videoCamSSTrack = null;
+      localVideoPlayer.srcObject = null;
+      await removeAudioVideoSenders(rtpSenders);
     }
   }
 
-  async function RemoveAudioVideoSenders(rtpSenders) {
-    for (var con_id in peers_con_ids) {
-      if (rtpSenders[con_id] && IsConnectionAvailable(peers_conns[con_id])) {
-        peers_conns[con_id].removeTrack(rtpSenders[con_id]);
-        rtpSenders[con_id] = null;
+  async function removeAudioVideoSenders(rtpSenders) {
+    await Promise.all(Object.keys(rtpSenders).map(async (conId) => {
+      if (rtpSenders[conId] && isConnectionAvailable(peersConns[conId])) {
+        peersConns[conId].removeTrack(rtpSenders[conId]);
+        rtpSenders[conId] = null;
       }
-    }
+    }));
   }
 
-  async function AddUpdateAudioVideoSenders(track, rtpSenders) {
-    for (var con_id in peers_con_ids) {
-      if (IsConnectionAvailable(peers_conns[con_id])) {
-        if (rtpSenders[con_id] && rtpSenders[con_id].track) {
-          rtpSenders[con_id].replaceTrack(track);
+  async function addUpdateAudioVideoSenders(track, rtpSenders) {
+    await Promise.all(Object.keys(rtpSenders).map(async (conId) => {
+      if (isConnectionAvailable(peersConns[conId])) {
+        if (rtpSenders[conId] && rtpSenders[conId].track) {
+          await rtpSenders[conId].replaceTrack(track);
         } else {
-          rtpSenders[con_id] = peers_conns[con_id].addTrack(track);
+          rtpSenders[conId] = peersConns[conId].addTrack(track);
         }
       }
-    }
+    }));
   }
 
-  async function startwithAudio() {
+  async function startWithAudio() {
     try {
-      var astream = await navigator.mediaDevices.getUserMedia({
+      const stream = await navigator.mediaDevices.getUserMedia({
         video: false,
-        audio: true,
+        audio: true
       });
-      _audioTrack = astream.getAudioTracks()[0];
+      
+      audioTrack = stream.getAudioTracks()[0];
+      audioTrack.enabled = false;
+      
+      audioTrack.onmute = (e) => console.log("Audio muted", e);
+      audioTrack.onunmute = (e) => console.log("Audio unmuted", e);
+    } catch (error) {
+      console.error("Audio start error:", error);
+      throw error;
+    }
+  }
 
-      _audioTrack.onmute = function (e) {
-        console.log(e);
+  async function createConnection(connId) {
+    try {
+      const connection = new RTCPeerConnection(ICE_CONFIGURATION);
+      
+      // Event handlers
+      connection.onicecandidate = (event) => {
+        if (event.candidate) {
+          serverFn(JSON.stringify({ iceCandidate: event.candidate }), connId);
+        }
       };
-      _audioTrack.onunmute = function (e) {
-        console.log(e);
+      
+      connection.oniceconnectionstatechange = () => {
+        console.log("ICE connection state:", connection.iceConnectionState);
       };
-
-      _audioTrack.enabled = false;
-    } catch (e) {
-      console.log(e);
-      return;
+      
+      connection.onsignalingstatechange = () => {
+        console.log("Signaling state:", connection.signalingState);
+      };
+      
+      connection.onconnectionstatechange = () => {
+        console.log("Connection state:", connection.connectionState);
+      };
+      
+      connection.ontrack = (event) => {
+        handleRemoteTrack(event, connId);
+      };
+      
+      // Store connection
+      peersConIds.push(connId);
+      peersConns[connId] = connection;
+      
+      // Add existing tracks if available
+      if ((videoState === VideoStates.CAMERA || videoState === VideoStates.SCREEN_SHARE) && videoCamSSTrack) {
+        await addUpdateAudioVideoSenders(videoCamSSTrack, rtpVideoSenders);
+      }
+      
+      return connection;
+    } catch (error) {
+      console.error("Connection creation error:", error);
+      throw error;
     }
   }
 
-  async function createConnection(connid) {
-    var connection = new RTCPeerConnection(iceConfiguration);
-    connection.onicecandidate = function (event) {
-      console.log("onicecandidate", event.candidate);
-      if (event.candidate) {
-        _serverFn(
-          JSON.stringify({
-            iceCandidate: event.candidate,
-          }),
-          connid
-        );
+  function handleRemoteTrack(event, connId) {
+    if (!event.track) return;
+
+    const track = event.track;
+    const kind = track.kind;
+    
+    if (kind === "video") {
+      if (!remoteVideoStreams[connId]) {
+        remoteVideoStreams[connId] = new MediaStream();
       }
-    };
-    connection.onicecandidateerror = function (event) {
-      console.log("onicecandidateerror", event);
-    };
-    connection.onicegatheringstatechange = function (event) {
-      console.log("onicegatheringstatechange", event);
-    };
-    connection.onnegotiationneeded = async function (event) {
-      console.log("onnegotiationneeded", event);
-      await _createOffer(connid);
-    };
-    connection.onconnectionstatechange = function (event) {
-      console.log(
-        "onconnectionstatechange",
-        event.currentTarget.connectionState
-      );
-      if (event.currentTarget.connectionState === "connected") {
-        console.log("connected");
+      
+      // Clear existing tracks of same kind
+      remoteVideoStreams[connId].getTracks().forEach(t => remoteVideoStreams[connId].removeTrack(t));
+      remoteVideoStreams[connId].addTrack(track);
+      
+      const remoteVideoPlayer = document.getElementById(`v_${connId}`);
+      if (remoteVideoPlayer) {
+        remoteVideoPlayer.srcObject = remoteVideoStreams[connId];
       }
-      if (event.currentTarget.connectionState === "disconnected") {
-        console.log("disconnected");
+    } 
+    else if (kind === "audio") {
+      if (!remoteAudioStreams[connId]) {
+        remoteAudioStreams[connId] = new MediaStream();
       }
-    };
-    // New remote media stream was added
-    connection.ontrack = function (event) {
-      // event.track.onunmute = () => {
-      //     alert('unmuted');
-      // };
-
-      if (!_remoteVideoStreams[connid]) {
-        _remoteVideoStreams[connid] = new MediaStream();
-      }
-
-      if (!_remoteAudioStreams[connid])
-        _remoteAudioStreams[connid] = new MediaStream();
-
-      if (event.track.kind == "video") {
-        _remoteVideoStreams[connid]
-          .getVideoTracks()
-          .forEach((t) => _remoteVideoStreams[connid].removeTrack(t));
-        _remoteVideoStreams[connid].addTrack(event.track);
-        //_remoteVideoStreams[connid].getTracks().forEach(t => console.log(t));
-
-        var _remoteVideoPlayer = document.getElementById("v_" + connid);
-        _remoteVideoPlayer.srcObject = null;
-        _remoteVideoPlayer.srcObject = _remoteVideoStreams[connid];
-        _remoteVideoPlayer.load();
-        //$(_remoteVideoPlayer).show();
-
-        // event.track.onmute = function() {
-        //     console.log(connid + ' muted');
-        //    console.log(this.muted+ ' muted');
-        //    console.log(event.track.muted+ ' muted');
-        //    console.log(this.readyState+ ' muted');
-        //    console.log('muted',this);
-        //    console.log('muted',_remoteVideoStreams[connid] );
-        //    console.log('muted',_remoteVideoPlayer.paused);
-        //    console.log('muted',_remoteVideoPlayer.readyState );
-        //    console.log('muted',_remoteVideoPlayer.ended );
-        //    if(this.muted){
-        //     //_remoteVideoPlayer.srcObject = null;
-        //    }
-        // };
-      } else if (event.track.kind == "audio") {
-        var _remoteAudioPlayer = document.getElementById("a_" + connid);
-        _remoteAudioStreams[connid]
-          .getVideoTracks()
-          .forEach((t) => _remoteAudioStreams[connid].removeTrack(t));
-        _remoteAudioStreams[connid].addTrack(event.track);
-        _remoteAudioPlayer.srcObject = null;
-        _remoteAudioPlayer.srcObject = _remoteAudioStreams[connid];
-        _remoteAudioPlayer.load();
-      }
-    };
-
-    peers_con_ids[connid] = connid;
-    peers_conns[connid] = connection;
-
-    if (
-      _videoState == VideoStates.Camera ||
-      _videoState == VideoStates.ScreenShare
-    ) {
-      if (_videoCamSSTrack) {
-        AddUpdateAudioVideoSenders(_videoCamSSTrack, _rtpVideoSenders);
-      }
-    }
-
-    return connection;
-  }
-
-  async function _createOffer(connid) {
-    //await createConnection();
-    var connection = peers_conns[connid];
-    console.log("connection.signalingState:" + connection.signalingState);
-    var offer = await connection.createOffer();
-    await connection.setLocalDescription(offer);
-    //Send offer to Server
-    _serverFn(
-      JSON.stringify({
-        offer: connection.localDescription,
-      }),
-      connid
-    );
-  }
-  async function exchangeSDP(message, from_connid) {
-    console.log("messag", message);
-    message = JSON.parse(message);
-
-    if (message.answer) {
-      console.log("answer", message.answer);
-      await peers_conns[from_connid].setRemoteDescription(
-        new RTCSessionDescription(message.answer)
-      );
-      console.log("connection", peers_conns[from_connid]);
-    } else if (message.offer) {
-      console.log("offer", message.offer);
-
-      if (!peers_conns[from_connid]) {
-        await createConnection(from_connid);
-      }
-
-      await peers_conns[from_connid].setRemoteDescription(
-        new RTCSessionDescription(message.offer)
-      );
-      var answer = await peers_conns[from_connid].createAnswer();
-      await peers_conns[from_connid].setLocalDescription(answer);
-      _serverFn(
-        JSON.stringify({
-          answer: answer,
-        }),
-        from_connid,
-        _my_connid
-      );
-    } else if (message.iceCandidate) {
-      console.log("iceCandidate", message.iceCandidate);
-      if (!peers_conns[from_connid]) {
-        await createConnection(from_connid);
-      }
-
-      try {
-        await peers_conns[from_connid].addIceCandidate(message.iceCandidate);
-      } catch (e) {
-        console.log(e);
+      
+      remoteAudioStreams[connId].getTracks().forEach(t => remoteAudioStreams[connId].removeTrack(t));
+      remoteAudioStreams[connId].addTrack(track);
+      
+      const remoteAudioPlayer = document.getElementById(`a_${connId}`);
+      if (remoteAudioPlayer) {
+        remoteAudioPlayer.srcObject = remoteAudioStreams[connId];
       }
     }
   }
 
-  function IsConnectionAvailable(connection) {
-    if (
-      connection &&
-      (connection.connectionState == "new" ||
-        connection.connectionState == "connecting" ||
-        connection.connectionState == "connected")
-    ) {
-      return true;
-    } else return false;
-  }
-
-  function closeConnection(connid) {
-    peers_con_ids[connid] = null;
-
-    if (peers_conns[connid]) {
-      peers_conns[connid].close();
-      peers_conns[connid] = null;
-    }
-    if (_remoteAudioStreams[connid]) {
-      _remoteAudioStreams[connid].getTracks().forEach((t) => {
-        if (t.stop) t.stop();
-      });
-      _remoteAudioStreams[connid] = null;
-    }
-
-    if (_remoteVideoStreams[connid]) {
-      _remoteVideoStreams[connid].getTracks().forEach((t) => {
-        if (t.stop) t.stop();
-      });
-      _remoteVideoStreams[connid] = null;
+  async function createOffer(connId) {
+    try {
+      const connection = peersConns[connId];
+      if (!connection) throw new Error("Connection not found");
+      
+      const offer = await connection.createOffer();
+      await connection.setLocalDescription(offer);
+      
+      serverFn(JSON.stringify({ offer: connection.localDescription }), connId);
+    } catch (error) {
+      console.error("Offer creation error:", error);
+      throw error;
     }
   }
+
+  async function exchangeSDP(message, fromConnId) {
+    try {
+      const data = JSON.parse(message);
+      
+      if (!peersConns[fromConnId]) {
+        await createConnection(fromConnId);
+      }
+      
+      if (data.answer) {
+        await peersConns[fromConnId].setRemoteDescription(new RTCSessionDescription(data.answer));
+      } 
+      else if (data.offer) {
+        await peersConns[fromConnId].setRemoteDescription(new RTCSessionDescription(data.offer));
+        const answer = await peersConns[fromConnId].createAnswer();
+        await peersConns[fromConnId].setLocalDescription(answer);
+        
+        serverFn(JSON.stringify({ answer }), fromConnId, myConnId);
+      } 
+      else if (data.iceCandidate) {
+        try {
+          await peersConns[fromConnId].addIceCandidate(data.iceCandidate);
+        } catch (e) {
+          console.error("Error adding ICE candidate:", e);
+        }
+      }
+    } catch (error) {
+      console.error("SDP exchange error:", error);
+      throw error;
+    }
+  }
+
+  function isConnectionAvailable(connection) {
+    return connection && 
+           ["new", "connecting", "connected"].includes(connection.connectionState);
+  }
+
+  function closeConnection(connId) {
+    try {
+      // Remove from peer lists
+      peersConIds = peersConIds.filter(id => id !== connId);
+      
+      // Close RTCPeerConnection
+      if (peersConns[connId]) {
+        peersConns[connId].close();
+        delete peersConns[connId];
+      }
+      
+      // Clean up media streams
+      cleanupMediaStream(remoteAudioStreams, connId);
+      cleanupMediaStream(remoteVideoStreams, connId);
+      
+      // Clean up senders
+      delete rtpAudioSenders[connId];
+      delete rtpVideoSenders[connId];
+    } catch (error) {
+      console.error("Connection close error:", error);
+    }
+  }
+
+  function cleanupMediaStream(streams, connId) {
+    if (streams[connId]) {
+      streams[connId].getTracks().forEach(track => track.stop());
+      delete streams[connId];
+    }
+  }
+
+  function showAlert(message) {
+    // Consider using a more user-friendly notification system
+    console.warn("Alert:", message);
+    alert(message);
+  }
+
+  // Public API
   return {
-    init: async function (serverFn, my_connid) {
-      await _init(serverFn, my_connid);
+    init: async function(serverFn, myConnId) {
+      await init(serverFn, myConnId);
     },
-    ExecuteClientFn: async function (data, from_connid) {
-      await exchangeSDP(data, from_connid);
+    executeClientFn: async function(data, fromConnId) {
+      await exchangeSDP(data, fromConnId);
     },
-    createNewConnection: async function (connid) {
-      await createConnection(connid);
+    createNewConnection: async function(connId) {
+      await createConnection(connId);
     },
-    closeExistingConnection: function (connid) {
-      closeConnection(connid);
-    },
+    closeExistingConnection: function(connId) {
+      closeConnection(connId);
+    }
   };
 })();
-var MyApp = (function () {
-  var socket = null;
-  var socker_url = "http://localhost:3000";
-  var meeting_id = "";
-  var user_id = "";
 
+var MyApp = (function() {
+  // Constants
+  const DEFAULT_SOCKET_URL = "http://localhost:3000";
+  
+  // Private variables
+  let socket = null;
+  let meetingId = "";
+  let userId = "";
+
+  // Private methods
   function init(uid, mid) {
-    user_id = uid;
-    meeting_id = mid;
+    userId = uid;
+    meetingId = mid;
 
-    // $("#meetingname").text(meeting_id);
-    $("#me h2").text(user_id + "(Me)");
-    document.title = user_id;
+    // Update UI
+    $("#me h2").text(`${userId}(Me)`);
+    document.title = userId;
 
-    SignalServerEventBinding();
-    EventBinding();
-    $(document).on("click", ".share-button-wrap", function () {
-      var attachFileArea = document.querySelector(".show-attach-file");
-      var fileeName = $("#customFile").val().split("\\").pop();
-      alert(fileeName);
-      var FileePath = "/attachment/" + meeting_id + "/" + fileeName + "";
-      // send({
-      //   type: "filee",
-      //   username: user_id,
-      //   meetingid: meeting_id,
-      //   FileePath: FileePath,
-      //   fileeName: fileeName,
-      // });
-      attachFileArea.innerHTML +=
-        "<div class='left-align' style='display:flex;align-items:center;'><img src='assets/images/other.jpg' style='height:40px;width:40px;' class='caller-image circle'><div style='font-weight:600;margin:0 5px;'>" +
-        user_id +
-        "</div>: <div><a style='color:#007bff;' href='" +
-        FileePath +
-        "' download>" +
-        fileeName +
-        "</a></div></div><br/>";
-      $("label.custom-file-label").text("");
-      socket.emit("fileTransferToOther", {
-        username: user_id,
-        meetingid: meeting_id,
-        FileePath: FileePath,
-        fileeName: fileeName,
-      });
-    });
+    // Initialize event handlers
+    signalServerEventBinding();
+    bindEvents();
   }
 
-  // function sentFileFunc(FileSenderMeetingID, FileSenderUsername) {
+  function signalServerEventBinding() {
+    socket = io.connect(DEFAULT_SOCKET_URL, {
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000
+    });
 
-  // }
-  function SignalServerEventBinding() {
-    // Set up the SignalR connection
-    //$.connection.hub.logging = true;
-
-    //_hub = $.connection.webRtcHub;
-    //$.connection.hub.url = _hubUrl;
-
-    socket = io.connect();
-
-    var serverFn = function (data, to_connid) {
+    const serverFn = (data, toConnId) => {
       socket.emit("exchangeSDP", {
         message: data,
-        to_connid: to_connid,
+        to_connid: toConnId
       });
-      //_hub.server.exchangeSDP(data, to_connid);
     };
 
-    socket.on("reset", function () {
-      location.reload();
-    });
+    // Socket event handlers
+    socket.on("connect", handleSocketConnect(serverFn));
+    socket.on("disconnect", handleSocketDisconnect);
+    socket.on("reset", handleReset);
+    socket.on("exchangeSDP", handleExchangeSDP);
+    socket.on("informAboutNewConnection", handleNewConnection);
+    socket.on("informAboutConnectionEnd", handleConnectionEnd);
+    socket.on("showChatMessage", showChatMessage);
+    socket.on("showFileMessage", showFileMessage);
+    socket.on("userconnected", handleUserConnected);
+    socket.on("connect_error", handleConnectError);
+  }
 
-    socket.on("exchangeSDP", async function (data) {
-      //alert(from_connid);
-      await WrtcHelper.ExecuteClientFn(data.message, data.from_connid);
-    });
-
-    socket.on("informAboutNewConnection", function (data) {
-      AddNewUser(data.other_user_id, data.connId, data.userNumber);
-      WrtcHelper.createNewConnection(data.connId);
-    });
-
-    socket.on("informAboutConnectionEnd", function (data) {
-      $("#" + data.connId).remove();
-      $(".participant-count").text(data.userCoun);
-      $("#participant_" + data.connId + "").remove();
-      WrtcHelper.closeExistingConnection(data.connId);
-    });
-
-    socket.on("showChatMessage", function (data) {
-      var time = new Date();
-      // var timeDiv = document.getElementsByClassName("top-left-time-wrap");
-      var lTime = time.toLocaleString("en-US", {
-        hour: "numeric",
-        minute: "numeric",
-        hour12: true,
-      });
-
-      var div = $("<div>").html(
-        "<span class='font-weight-bold mr-3' style='color:black'>" +
-          data.from +
-          "</span> " +
-          lTime +
-          "</br>" +
-          data.message
-      );
-      $("#messages").append(div);
-    });
-    socket.on("showFileMessage", function (data) {
-      var time = new Date();
-      // var timeDiv = document.getElementsByClassName("top-left-time-wrap");
-      var lTime = time.toLocaleString("en-US", {
-        hour: "numeric",
-        minute: "numeric",
-        hour12: true,
-      });
-
-      var attachFileArea = document.querySelector(".show-attach-file");
-      // var fileeName = $("#customFile").val().split("\\").pop();
-      // alert(fileeName);
-      // var FileePath = "/attachment/" + meeting_id + "/" + fileeName + "";
-      // send({
-      //   type: "filee",
-      //   username: user_id,
-      //   meetingid: meeting_id,
-      //   FileePath: FileePath,
-      //   fileeName: fileeName,
-      // });
-      attachFileArea.innerHTML +=
-        "<div class='left-align' style='display:flex;align-items:center;'><img src='assets/images/other.jpg' style='height:40px;width:40px;' class='caller-image circle'><div style='font-weight:600;margin:0 5px;'>" +
-        data.username +
-        "</div>: <div><a style='color:#007bff;' href='" +
-        data.FileePath +
-        "' download>" +
-        data.fileeName +
-        "</a></div></div><br/>";
-    });
-
-    socket.on("connect", () => {
+  function handleSocketConnect(serverFn) {
+    return () => {
       if (socket.connected) {
         WrtcHelper.init(serverFn, socket.id);
 
-        if (user_id != "" && meeting_id != "") {
+        if (userId && meetingId) {
           socket.emit("userconnect", {
-            dsiplayName: user_id,
-            meetingid: meeting_id,
+            displayName: userId,
+            meetingid: meetingId
           });
-          //_hub.server.connect(user_id, meeting_id)
         }
       }
-    });
-
-    socket.on("userconnected", function (other_users) {
-      var userNumber = other_users.length;
-      var userNumb = userNumber + 1;
-      $("#divUsers .other").remove();
-      if (other_users) {
-        for (var i = 0; i < other_users.length; i++) {
-          AddNewUser(
-            other_users[i].user_id,
-            other_users[i].connectionId,
-            userNumb
-          );
-          WrtcHelper.createNewConnection(other_users[i].connectionId);
-        }
-      }
-      $(".toolbox").show();
-      $("#messages").show();
-      $("#divUsers").show();
-    });
+    };
   }
 
-  function EventBinding() {
-    $("#btnResetMeeting").on("click", function () {
-      socket.emit("reset");
-    });
-
-    $("#btnsend").on("click", function () {
-      //_hub.server.sendMessage($('#msgbox').val());
-      socket.emit("sendMessage", $("#msgbox").val());
-      $("#msgbox").val("");
-    });
-
-    $("#divUsers").on("dblclick", "video", function () {
-      this.requestFullscreen();
-    });
+  function handleSocketDisconnect() {
+    console.log("Disconnected from signaling server");
+    // Consider showing reconnect UI
   }
-  var userNum;
 
-  function AddNewUser(other_user_id, connId, userNum) {
-    var $newDiv = $("#otherTemplate").clone();
-    $newDiv = $newDiv.attr("id", connId).addClass("other");
-    $newDiv.find("h2").text(other_user_id);
-    $newDiv.find("video").attr("id", "v_" + connId);
-    $newDiv.find("audio").attr("id", "a_" + connId);
-    $newDiv.show();
+  function handleReset() {
+    location.reload();
+  }
+
+  async function handleExchangeSDP(data) {
+    try {
+      await WrtcHelper.executeClientFn(data.message, data.from_connid);
+    } catch (error) {
+      console.error("Error handling SDP exchange:", error);
+    }
+  }
+
+  function handleNewConnection(data) {
+    addNewUser(data.other_user_id, data.connId, data.userNumber);
+    WrtcHelper.createNewConnection(data.connId);
+  }
+
+  function handleConnectionEnd(data) {
+    $(`#${data.connId}`).remove();
+    $(`#participant_${data.connId}`).remove();
+    $(".participant-count").text(data.userCoun);
+    WrtcHelper.closeExistingConnection(data.connId);
+  }
+
+  function showChatMessage(data) {
+    const time = new Date().toLocaleString("en-US", {
+      hour: "numeric",
+      minute: "numeric",
+      hour12: true
+    });
+
+    const messageHtml = `
+      <div class="message">
+        <span class="font-weight-bold mr-3" style="color:black">${data.from}</span>
+        ${time}<br/>
+        ${data.message}
+      </div>
+    `;
+    
+    $("#messages").append(messageHtml);
+    scrollToBottom();
+  }
+
+  function showFileMessage(data) {
+    const attachFileArea = document.querySelector(".show-attach-file");
+    if (!attachFileArea) return;
+
+    const fileHtml = `
+      <div class="left-align" style="display:flex;align-items:center;">
+        <img src="assets/images/other.jpg" style="height:40px;width:40px;" class="caller-image circle">
+        <div style="font-weight:600;margin:0 5px;">${data.username}</div>: 
+        <div>
+          <a style="color:#007bff;" href="${data.FileePath}" download>
+            ${data.fileeName}
+          </a>
+        </div>
+      </div>
+      <br/>
+    `;
+    
+    attachFileArea.insertAdjacentHTML("beforeend", fileHtml);
+    scrollToBottom();
+  }
+
+  function handleUserConnected(otherUsers) {
+    $("#divUsers .other").remove();
+    
+    const userCount = otherUsers.length + 1;
+    
+    otherUsers.forEach(user => {
+      addNewUser(user.user_id, user.connectionId, userCount);
+      WrtcHelper.createNewConnection(user.connectionId);
+    });
+
+    $(".toolbox").show();
+    $("#messages").show();
+    $("#divUsers").show();
+  }
+
+  function handleConnectError(error) {
+    console.error("Connection error:", error);
+    // Consider showing error to user and retry logic
+  }
+
+  function bindEvents() {
+    $("#btnResetMeeting").on("click", () => socket.emit("reset"));
+    
+    $("#btnsend").on("click", sendChatMessage);
+    
+    $("#divUsers").on("dblclick", "video", function() {
+      this.requestFullscreen().catch(e => console.error("Fullscreen error:", e));
+    });
+    
+    $(".share-button-wrap").on("click", handleFileShare);
+  }
+
+  function sendChatMessage() {
+    const message = $("#msgbox").val().trim();
+    if (!message) return;
+
+    socket.emit("sendMessage", message);
+    $("#msgbox").val("");
+  }
+
+  function handleFileShare() {
+    const fileInput = $("#customFile")[0];
+    if (!fileInput || !fileInput.files.length) return;
+
+    const fileName = fileInput.files[0].name;
+    const filePath = `/attachment/${meetingId}/${fileName}`;
+
+    const attachFileArea = document.querySelector(".show-attach-file");
+    if (!attachFileArea) return;
+
+    // Add to local UI immediately
+    attachFileArea.insertAdjacentHTML("beforeend", `
+      <div class="left-align" style="display:flex;align-items:center;">
+        <img src="assets/images/other.jpg" style="height:40px;width:40px;" class="caller-image circle">
+        <div style="font-weight:600;margin:0 5px;">${userId}</div>: 
+        <div>
+          <a style="color:#007bff;" href="${filePath}" download>
+            ${fileName}
+          </a>
+        </div>
+      </div>
+      <br/>
+    `);
+
+    // Send to other participants
+    socket.emit("fileTransferToOther", {
+      username: userId,
+      meetingid: meetingId,
+      FileePath: filePath,
+      fileeName: fileName
+    });
+
+    // Clear file input
+    $("label.custom-file-label").text("");
+  }
+
+  function addNewUser(otherUserId, connId, userCount) {
+    // Add to video grid
+    const $newDiv = $("#otherTemplate").clone()
+      .attr("id", connId)
+      .addClass("other")
+      .show();
+    
+    $newDiv.find("h2").text(otherUserId);
+    $newDiv.find("video").attr("id", `v_${connId}`);
+    $newDiv.find("audio").attr("id", `a_${connId}`);
+    
     $("#divUsers").append($newDiv);
-    $(".in-call-wrap-up").append(
-      '<div class="in-call-wrap d-flex justify-content-between align-items-center mb-3" id="participant_' +
-        connId +
-        '" style=""> <div class="participant-img-name-wrap display-center cursor-pointer"> <div class="participant-img"> <img src="images/me2.png" alt="" class="border border-secondary" style="height: 40px;width: 40px;border-radius: 50%;"> </div> <div class="participant-name ml-2">' +
-        other_user_id +
-        '</div> </div> <div class="participant-action-wrap display-center"> <div class="participant-action-dot display-center mr-2 cursor-pointer"> <span class="material-icons"> more_vert </span> </div> <div class="participant-action-pin display-center cursor-pointer"> <span class="material-icons"> push_pin </span> </div> </div> </div>'
-    );
 
-    $(".participant-count").text(userNum);
+    // Add to participant list
+    $(".in-call-wrap-up").append(`
+      <div class="in-call-wrap d-flex justify-content-between align-items-center mb-3" id="participant_${connId}">
+        <div class="participant-img-name-wrap display-center cursor-pointer">
+          <div class="participant-img">
+            <img src="images/me2.png" alt="" class="border border-secondary" style="height:40px;width:40px;border-radius:50%;">
+          </div>
+          <div class="participant-name ml-2">${otherUserId}</div>
+        </div>
+        <div class="participant-action-wrap display-center">
+          <div class="participant-action-dot display-center mr-2 cursor-pointer">
+            <span class="material-icons">more_vert</span>
+          </div>
+          <div class="participant-action-pin display-center cursor-pointer">
+            <span class="material-icons">push_pin</span>
+          </div>
+        </div>
+      </div>
+    `);
+
+    $(".participant-count").text(userCount);
   }
 
+  function scrollToBottom() {
+    const messagesContainer = $("#messages")[0];
+    if (messagesContainer) {
+      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    }
+  }
+
+  // Public API
   return {
-    _init: function (uid, mid) {
+    _init: function(uid, mid) {
       init(uid, mid);
-    },
+    }
   };
 })();
